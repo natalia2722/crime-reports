@@ -12,6 +12,7 @@ from PIL import Image
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import timedelta
+from geopy.geocoders import Nominatim
 
 UPLOAD_FOLDER = "uploaded_files"
 
@@ -29,6 +30,7 @@ def init_db():
          deskripsi TEXT,
          lokasi TEXT,
          wilayah TEXT,
+         alamat TEXT,
          latitude REAL,
          longitude REAL,
          jam TIME, -- Menggunakan tipe TIME
@@ -40,6 +42,65 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
+    
+    
+def create_day_analysis_chart():
+    conn = sqlite3.connect('crime_reports.db')
+    
+    # Query kasus berdasarkan hari
+    day_data = pd.read_sql_query("""
+        SELECT hari, COUNT(*) as count
+        FROM reports
+        GROUP BY hari
+        ORDER BY CASE
+            WHEN hari = 'Monday' THEN 1
+            WHEN hari = 'Tuesday' THEN 2
+            WHEN hari = 'Wednesday' THEN 3
+            WHEN hari = 'Thursday' THEN 4
+            WHEN hari = 'Friday' THEN 5
+            WHEN hari = 'Saturday' THEN 6
+            WHEN hari = 'Sunday' THEN 7
+        END
+    """, conn)
+    
+    # Mapping hari dari Inggris ke Indonesia
+    day_mapping = {
+        'Monday': 'Senin',
+        'Tuesday': 'Selasa',
+        'Wednesday': 'Rabu',
+        'Thursday': 'Kamis',
+        'Friday': 'Jumat',
+        'Saturday': 'Sabtu',
+        'Sunday': 'Minggu'
+    }
+    
+    # Ubah nama hari ke bahasa Indonesia
+    day_data['hari'] = day_data['hari'].map(day_mapping)
+    
+    conn.close()
+    
+    # Buat visualisasi
+    day_fig = px.bar(
+        day_data,
+        x='hari',
+        y='count',
+        title='Distribusi Kejahatan Berdasarkan Hari',
+        labels={'hari': 'Hari', 'count': 'Jumlah Kejadian'},
+        text='count'
+    )
+    
+    day_fig.update_traces(textposition='outside')
+    day_fig.update_layout(xaxis_title="Hari dalam Seminggu", yaxis_title="Jumlah Kejadian")
+    
+    return day_fig
+
+def get_address_from_coordinates(lat, lon):
+    geolocator = Nominatim(user_agent="crime_reports")
+    try:
+        location = geolocator.reverse((lat, lon), exactly_one=True)
+        return location.address if location else "Alamat tidak ditemukan"
+    except Exception as e:
+        return f"Error: {e}"
 
 def calculate_risk_category(count):
     if count < 5:
@@ -219,12 +280,18 @@ def main():
             m = folium.Map(location=[-5.1477, 119.4328], zoom_start=12)
             map_data = st_folium(m, height=300)
             
-            # Update and display location immediately when map is clicked
+            # Update lokasi yang diklik dan tampilkan alamat
             if map_data['last_clicked']:
                 st.session_state.selected_location = map_data['last_clicked']
+                latitude = st.session_state.selected_location['lat']
+                longitude = st.session_state.selected_location['lng']
+                
+                # Dapatkan alamat menggunakan fungsi geocoding
+                address = get_address_from_coordinates(latitude, longitude)
+                
                 st.success(
-                    f"Lokasi dipilih: Latitude {st.session_state.selected_location['lat']:.6f}, "
-                    f"Longitude {st.session_state.selected_location['lng']:.6f}"
+                    f"Lokasi dipilih: Latitude {latitude:.6f}, Longitude {longitude:.6f}\n"
+                    f"Alamat: {address}"
                 )
             
             deskripsi = st.text_area("Deskripsi Kejadian")
@@ -252,11 +319,11 @@ def main():
                     # Simpan waktu dalam format HH:MM:SS
                     c.execute("""
                         INSERT INTO reports (tanggal, jenis_kejahatan, deskripsi, lokasi, wilayah,
-                        latitude, longitude, jam, hari, bulan, file_bukti)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        latitude, longitude, jam, hari, bulan, file_bukti, alamat)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (tanggal.strftime("%Y-%m-%d"), jenis_kejahatan, deskripsi,
-                          f"Lat: {latitude}, Lng: {longitude}", wilayah,
-                          latitude, longitude, jam.strftime("%H:%M:%S"), hari, bulan, bukti_path))
+                        f"Lat: {latitude}, Lng: {longitude}", wilayah,
+                        latitude, longitude, jam.strftime("%H:%M:%S"), hari, bulan, bukti_path, address))
                     
                     conn.commit()
                     conn.close()
@@ -273,16 +340,16 @@ def main():
         st.subheader("Statistik per Wilayah")
         st.dataframe(stats)
         
-        # Create visualization
-        fig = px.bar(stats, x='wilayah', y='jumlah_kasus',
-                    color='kategori_risiko',
-                    title='Jumlah Kejahatan per Wilayah')
-        st.plotly_chart(fig)
-        
-        # Time-based analysis
+        # Create visualizations
+        st.subheader("Analisis Distribusi Kejahatan Berdasarkan Waktu")
         hourly_fig, monthly_fig = create_time_analysis_charts()
         st.plotly_chart(hourly_fig)
         st.plotly_chart(monthly_fig)
+        
+        # Add day analysis chart
+        st.subheader("Distribusi Kejahatan Berdasarkan Hari")
+        day_fig = create_day_analysis_chart()
+        st.plotly_chart(day_fig)
 
     elif menu == "Peta Kejahatan":
         st.title("Peta Distribusi Kejahatan")
@@ -323,7 +390,7 @@ def main():
         st.title("Pencarian Laporan")
         
         # Search filters
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3 = st.columns([2, 2, 1])  # Membuat kolom yang lebih lebar untuk tanggal dan filter lainnya
         
         with col1:
             wilayah_filter = st.selectbox(
@@ -338,16 +405,31 @@ def main():
             )
         
         with col3:
-            date_filter = st.date_input("Filter Tanggal")
+            reset_button = st.button("Reset Tanggal")  # Tombol reset berada di kanan filter jenis kejahatan
+        
+        # Filter Tanggal (Bawah filter wilayah dan jenis kejahatan)
+        col4, col5 = st.columns(2)  # Membuat kolom untuk tanggal mulai dan selesai
+        
+        with col4:
+            start_date = st.date_input("Filter Tanggal Mulai", min_value=pd.to_datetime('2020-01-01'))
+        
+        with col5:
+            end_date = st.date_input("Filter Tanggal Selesai", min_value=start_date)
+        
+        # Reset filter tanggal jika tombol ditekan
+        if reset_button:
+            start_date = None
+            end_date = None
         
         # Build query
         query = """
             SELECT id_laporan, tanggal, jenis_kejahatan, deskripsi, 
-                wilayah, lokasi, file_bukti, timestamp 
+                wilayah, lokasi, file_bukti, timestamp, alamat, hari
             FROM reports WHERE 1=1
         """
         params = []
         
+        # Apply filters
         if wilayah_filter != "Semua":
             query += " AND wilayah = ?"
             params.append(wilayah_filter)
@@ -356,9 +438,13 @@ def main():
             query += " AND jenis_kejahatan = ?"
             params.append(jenis_filter)
         
-        if date_filter:
-            query += " AND date(tanggal) = ?"
-            params.append(date_filter.strftime("%Y-%m-%d"))
+        if start_date and end_date:
+            query += " AND date(tanggal) BETWEEN ? AND ?"
+            params.append(start_date.strftime("%Y-%m-%d"))
+            params.append(end_date.strftime("%Y-%m-%d"))
+        elif not start_date and not end_date:
+            # Jika tidak ada filter tanggal, tampilkan semua laporan
+            pass
         
         # Execute search
         conn = sqlite3.connect('crime_reports.db')
@@ -388,9 +474,27 @@ def main():
                     with col2:
                         st.write(f"**Wilayah:** {report['wilayah']}")
                         st.write(f"**Lokasi:** {report['lokasi']}")
+                        
+                        # Mapping hari dari Inggris ke Indonesia
+                        day_mapping = {
+                            'Monday': 'Senin',
+                            'Tuesday': 'Selasa',
+                            'Wednesday': 'Rabu',
+                            'Thursday': 'Kamis',
+                            'Friday': 'Jumat',
+                            'Saturday': 'Sabtu',
+                            'Sunday': 'Minggu'
+                        }
+
+                        # Mengubah hari dari bahasa Inggris ke bahasa Indonesia
+                        hari_indonesia = day_mapping.get(report['hari'], report['hari'])
+                        
+                        st.write(f"**Hari:** {hari_indonesia}")
                         st.write(f"**Deskripsi:**")
                         st.write(report['deskripsi'])
+                        st.write(f"**Alamat:** {report['alamat'] if report['alamat'] else 'Alamat tidak tersedia'}")
                         st.write(f"**Waktu Laporan:** {report['timestamp']}")
+                        
         else:
             st.write("Tidak ada laporan yang sesuai dengan kriteria pencarian.")
 
